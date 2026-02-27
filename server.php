@@ -38,6 +38,7 @@ use Psr\Http\Message\RequestInterface;
 use Symfony\Component\Routing\Route;
 use Symfony\Component\Routing\RouteCollection;
 use Symfony\Component\Routing\RequestContext;
+use Symfony\Component\Routing\Matcher\UrlMatcher;
 use Ratchet\Http\Router;
 use Ratchet\WebSocket\WsServer;
 
@@ -437,7 +438,7 @@ class HttpHandler implements HttpServerInterface
      * Called when an HTTP request is received.
      * Dispatches to the appropriate handler based on path and method.
      */
-    public function onOpen(ConnectionInterface $conn, RequestInterface $request = null): void
+    public function onOpen(ConnectionInterface $conn, ?RequestInterface $request = null): void
     {
         $path = $request->getUri()->getPath();
         $method = $request->getMethod();
@@ -541,14 +542,37 @@ class HttpHandler implements HttpServerInterface
 // SERVER SETUP - Ratchet IoServer with Router (WS + HTTP on same port)
 // ============================================================================
 
-$loop = Loop::get();
-
 // Create the WebSocket proxy handler
 $wsProxy = new LiveTextToSpeechProxy($apiKey, $DEEPGRAM_TTS_URL);
 
 // Create the WsServer wrapping the proxy, with subprotocol handling
 $wsServer = new WsServer($wsProxy);
 $wsServer->setStrictSubProtocolCheck(false);
+
+// Custom negotiator to accept access_token.* subprotocols
+$customNegotiator = new class(new \Ratchet\RFC6455\Handshake\RequestVerifier()) extends \Ratchet\RFC6455\Handshake\ServerNegotiator {
+    public function __construct(\Ratchet\RFC6455\Handshake\RequestVerifier $verifier) {
+        parent::__construct($verifier);
+        $this->setStrictSubProtocolCheck(false);
+    }
+    public function handshake(\Psr\Http\Message\RequestInterface $request): \Psr\Http\Message\ResponseInterface {
+        $response = parent::handshake($request);
+        if ($response->getStatusCode() === 101 && !$response->hasHeader('Sec-WebSocket-Protocol')) {
+            $protocols = $request->getHeader('Sec-WebSocket-Protocol');
+            $all = array_map('trim', explode(',', implode(',', $protocols)));
+            foreach ($all as $proto) {
+                if (str_starts_with($proto, 'access_token.')) {
+                    $response = $response->withHeader('Sec-WebSocket-Protocol', $proto);
+                    break;
+                }
+            }
+        }
+        return $response;
+    }
+};
+$ref = new \ReflectionProperty($wsServer, 'handshakeNegotiator');
+$ref->setAccessible(true);
+$ref->setValue($wsServer, $customNegotiator);
 
 // Create the HTTP handler for REST endpoints
 $httpHandler = new HttpHandler();
@@ -562,41 +586,63 @@ $routes->add('ws-live-tts', new Route(
     ['_controller' => $wsServer],
     [],
     [],
-    '',
+    null,
     [],
     ['GET']
+));
+
+// HTTP route: /api/session
+$routes->add('session', new Route(
+    '/api/session',
+    ['_controller' => $httpHandler],
+    [],
+    [],
+    null,
+    [],
+    ['GET', 'OPTIONS']
+));
+
+// HTTP route: /api/metadata
+$routes->add('metadata', new Route(
+    '/api/metadata',
+    ['_controller' => $httpHandler],
+    [],
+    [],
+    null,
+    [],
+    ['GET', 'OPTIONS']
 ));
 
 // HTTP route: /health
 $routes->add('health', new Route(
     '/health',
-    ['_controller' => new HttpServer($httpHandler)],
+    ['_controller' => $httpHandler],
     [],
     [],
-    '',
+    null,
     [],
     ['GET', 'OPTIONS']
 ));
 
-// HTTP routes: /api/{path} for session and metadata
-$routes->add('api-routes', new Route(
-    '/api/{path}',
-    ['_controller' => new HttpServer($httpHandler)],
-    ['path' => '.+'],
-    [],
-    '',
-    [],
-    ['GET', 'POST', 'OPTIONS']
+// Catch-all fallback (404)
+$routes->add('fallback', new Route(
+    '/{path}',
+    ['_controller' => $httpHandler],
+    ['path' => '.*']
 ));
 
-$router = new Router(new RequestContext(), $routes);
+$urlMatcher = new UrlMatcher($routes, new RequestContext());
+$router = new Router($urlMatcher);
 
 // Create the HTTP server wrapping the router
 $httpServer = new HttpServer($router);
 
-// Create the IO server on the event loop
-$socket = new \React\Socket\SocketServer("{$HOST}:{$PORT}", [], $loop);
-$server = new \Ratchet\Server\IoServer($httpServer, $socket, $loop);
+// Create the IO server (let IoServer::factory manage the event loop)
+$server = IoServer::factory(
+    $httpServer,
+    (int)$PORT,
+    $HOST
+);
 
 // ============================================================================
 // GRACEFUL SHUTDOWN - Clean up on SIGTERM/SIGINT
@@ -606,7 +652,7 @@ $server = new \Ratchet\Server\IoServer($httpServer, $socket, $loop);
  * Handles graceful shutdown on SIGTERM/SIGINT.
  * Closes all active WebSocket connections and stops the event loop.
  */
-$shutdown = function (int $signal) use ($wsProxy, $socket, $loop): void {
+$shutdown = function (int $signal) use ($wsProxy, $server): void {
     $signalName = $signal === SIGTERM ? 'SIGTERM' : 'SIGINT';
     echo "\n{$signalName} received: starting graceful shutdown...\n";
 
@@ -614,19 +660,19 @@ $shutdown = function (int $signal) use ($wsProxy, $socket, $loop): void {
     echo "Closing {$count} active WebSocket connection(s)...\n";
     $wsProxy->closeAll();
 
-    $socket->close();
+    $server->socket->close();
     echo "Server socket closed\n";
 
-    $loop->addTimer(1, function () use ($loop) {
+    $server->loop->addTimer(1, function () use ($server) {
         echo "Shutdown complete\n";
-        $loop->stop();
+        $server->loop->stop();
     });
 };
 
 // Register signal handlers (only works with pcntl extension)
 if (function_exists('pcntl_signal')) {
-    $loop->addSignal(SIGTERM, $shutdown);
-    $loop->addSignal(SIGINT, $shutdown);
+    $server->loop->addSignal(SIGTERM, $shutdown);
+    $server->loop->addSignal(SIGINT, $shutdown);
 }
 
 // ============================================================================
@@ -642,4 +688,4 @@ echo "GET  /api/metadata\n";
 echo "GET  /health\n";
 echo str_repeat('=', 70) . "\n\n";
 
-$loop->run();
+$server->run();
